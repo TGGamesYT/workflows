@@ -21,8 +21,6 @@ jobs:
       - name: Verify this is a Minecraft mod
         id: detect
         run: |
-          # Search for mod loader manifests in both single-loader (src/main/resources/...)
-          # and multi-loader (<loader>/src/main/resources/...) layouts.
           MANIFESTS=$(find . -maxdepth 5 \
             \( -name "fabric.mod.json" \
             -o -name "quilt.mod.json" \
@@ -42,10 +40,8 @@ jobs:
           echo "Found manifests:"
           echo "$MANIFESTS"
 
-          # Detect multi-loader: any manifest in a subproject like fabric/, forge/, neoforge/, quilt/
           MULTILOADER="false"
           while IFS= read -r m; do
-            # Strip leading ./
             rel="${m#./}"
             top="${rel%%/*}"
             case "$top" in
@@ -74,56 +70,173 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          extract_key() {
-            local field="$1"
+          # Look up a key in a gradle.properties-style file, returning its value (or empty).
+          lookup_in_props() {
+            local key="$1"
             local file="$2"
-            grep -E "^[[:space:]]*${field}[[:space:]]*=" "$file" \
+            [ -f "$file" ] || return
+            grep "^${key}[[:space:]]*=" "$file" 2>/dev/null \
               | head -n1 \
-              | sed -E "s/^[[:space:]]*${field}[[:space:]]*=[[:space:]]*(project\.)?([A-Za-z_][A-Za-z0-9_]*).*/\2/"
+              | cut -d'=' -f2- \
+              | tr -d ' \r'
           }
 
-          # Try root build.gradle first, then any subproject's
-          GRADLE_FILE=""
-          for f in build.gradle build.gradle.kts \
-                   common/build.gradle common/build.gradle.kts \
-                   fabric/build.gradle fabric/build.gradle.kts \
-                   forge/build.gradle forge/build.gradle.kts \
-                   neoforge/build.gradle neoforge/build.gradle.kts; do
-            if [ -f "$f" ]; then
-              # Prefer one that actually defines version + archivesName
-              if grep -qE "^[[:space:]]*version[[:space:]]*=" "$f" 2>/dev/null; then
-                GRADLE_FILE="$f"
-                break
+          # Look up a key, first in the gradle file's own dir, then walking up to repo root.
+          lookup_key() {
+            local key="$1"
+            local gradle_file="$2"
+            local dir
+            dir=$(dirname "$gradle_file")
+            while :; do
+              local v
+              v=$(lookup_in_props "$key" "$dir/gradle.properties")
+              if [ -n "$v" ]; then
+                echo "$v"
+                return
               fi
+              [ "$dir" = "." ] || [ "$dir" = "/" ] && return
+              dir=$(dirname "$dir")
+              [ -z "$dir" ] || [ "$dir" = "." ] && {
+                v=$(lookup_in_props "$key" "gradle.properties")
+                [ -n "$v" ] && echo "$v"
+                return
+              }
+            done
+          }
+
+          # Extract a field from a build.gradle. Returns one of:
+          #   LITERAL:<value>   -> hardcoded string
+          #   KEY:<key>         -> reference to a gradle.properties key
+          #   (empty)           -> field not found
+          extract_field() {
+            local field_pattern="$1"
+            local file="$2"
+
+            local line
+            line=$(grep -E "^[[:space:]]*(${field_pattern})[[:space:]]*=" "$file" 2>/dev/null | head -n1)
+            [ -z "$line" ] && return
+
+            # Literal string: archivesBaseName = "foo"
+            local literal
+            literal=$(echo "$line" | sed -nE "s/^[[:space:]]*(${field_pattern})[[:space:]]*=[[:space:]]*[\"']([^\"']+)[\"'].*/\2/p")
+            if [ -n "$literal" ]; then
+              echo "LITERAL:$literal"
+              return
             fi
+
+            # Identifier: archivesBaseName = archives_base_name (or project.archives_base_name)
+            local key
+            key=$(echo "$line" | sed -nE "s/^[[:space:]]*(${field_pattern})[[:space:]]*=[[:space:]]*(project\.)?([A-Za-z_][A-Za-z0-9_]*).*/\3/p")
+            [ -n "$key" ] && echo "KEY:$key"
+          }
+
+          # Resolve a field across candidate gradle files.
+          # On KEY match, looks up value in gradle.properties files starting from the gradle file's dir.
+          resolve_field() {
+            local field_pattern="$1"
+            shift
+            local files=("$@")
+
+            for f in "${files[@]}"; do
+              [ -f "$f" ] || continue
+              local result
+              result=$(extract_field "$field_pattern" "$f")
+              if [ -n "$result" ]; then
+                if [[ "$result" == LITERAL:* ]]; then
+                  echo "${result#LITERAL:}"
+                  return
+                elif [[ "$result" == KEY:* ]]; then
+                  local k="${result#KEY:}"
+                  local v
+                  v=$(lookup_key "$k" "$f")
+                  if [ -n "$v" ]; then
+                    echo "$v"
+                    return
+                  fi
+                fi
+              fi
+            done
+          }
+
+          # Also remember which file/key gave us the version, so we can bump the right place later.
+          locate_version_source() {
+            local files=("$@")
+            for f in "${files[@]}"; do
+              [ -f "$f" ] || continue
+              local result
+              result=$(extract_field "version" "$f")
+              if [[ "$result" == KEY:* ]]; then
+                local k="${result#KEY:}"
+                local dir
+                dir=$(dirname "$f")
+                while :; do
+                  if [ -f "$dir/gradle.properties" ] && grep -q "^${k}[[:space:]]*=" "$dir/gradle.properties"; then
+                    echo "$dir/gradle.properties:$k"
+                    return
+                  fi
+                  [ "$dir" = "." ] && {
+                    [ -f "gradle.properties" ] && grep -q "^${k}[[:space:]]*=" "gradle.properties" && echo "gradle.properties:$k"
+                    return
+                  }
+                  dir=$(dirname "$dir")
+                  [ -z "$dir" ] && return
+                done
+              fi
+            done
+          }
+
+          # Subprojects first (multi-loader puts the real config there), root last.
+          CANDIDATES=()
+          for d in fabric neoforge forge quilt common .; do
+            for ext in build.gradle build.gradle.kts; do
+              [ -f "$d/$ext" ] && CANDIDATES+=("$d/$ext")
+            done
           done
 
-          if [ -z "$GRADLE_FILE" ]; then
-            echo "::error::Could not find a build.gradle defining version"
+          if [ ${#CANDIDATES[@]} -eq 0 ]; then
+            echo "::error::No build.gradle files found"
             exit 1
           fi
 
-          echo "Using gradle file: $GRADLE_FILE"
+          echo "Searching gradle files: ${CANDIDATES[*]}"
 
-          VERSION_KEY=$(extract_key "version" "$GRADLE_FILE")
-          NAME_KEY=$(extract_key "archivesName" "$GRADLE_FILE")
-          [ -z "$VERSION_KEY" ] && VERSION_KEY="mod_version"
-          [ -z "$NAME_KEY" ] && NAME_KEY="archives_base_name"
+          BASE_VERSION=$(resolve_field "version" "${CANDIDATES[@]}")
+          NAME=$(resolve_field "archivesName|archivesBaseName|archives_base_name" "${CANDIDATES[@]}")
 
-          BASE_VERSION=$(grep "^${VERSION_KEY}[[:space:]]*=" gradle.properties | cut -d'=' -f2 | tr -d ' \r')
-          NAME=$(grep "^${NAME_KEY}[[:space:]]*=" gradle.properties | cut -d'=' -f2 | tr -d ' \r')
+          # Last-resort fallback to common keys in any gradle.properties (root + subdirs)
+          if [ -z "$BASE_VERSION" ]; then
+            for props in gradle.properties */gradle.properties; do
+              [ -f "$props" ] || continue
+              for k in mod_version version mcef_version; do
+                v=$(lookup_in_props "$k" "$props")
+                if [ -n "$v" ]; then BASE_VERSION="$v"; break 2; fi
+              done
+            done
+          fi
+          if [ -z "$NAME" ]; then
+            for props in gradle.properties */gradle.properties; do
+              [ -f "$props" ] || continue
+              for k in archives_base_name mod_id; do
+                v=$(lookup_in_props "$k" "$props")
+                if [ -n "$v" ]; then NAME="$v"; break 2; fi
+              done
+            done
+          fi
 
           if [ -z "$NAME" ] || [ -z "$BASE_VERSION" ]; then
             echo "::error::Failed to resolve mod name/version"
-            echo "  NAME='$NAME' (key=$NAME_KEY)"
-            echo "  VERSION='$BASE_VERSION' (key=$VERSION_KEY)"
+            echo "  NAME='$NAME'"
+            echo "  VERSION='$BASE_VERSION'"
             exit 1
           fi
 
           echo "Base version: $BASE_VERSION"
           echo "Mod name: $NAME"
 
-          # Find a free version: try BASE_VERSION first, then BASE_VERSION.1, .2, ...
+          # Locate where to bump the version (which gradle.properties + which key)
+          VERSION_SOURCE=$(locate_version_source "${CANDIDATES[@]}")
+          echo "Version source: ${VERSION_SOURCE:-(unknown)}"
+
           VERSION="$BASE_VERSION"
           i=1
           while gh release view "$VERSION" >/dev/null 2>&1; do
@@ -134,11 +247,28 @@ jobs:
           echo "Resolved free version: $VERSION"
 
           if [ "$VERSION" != "$BASE_VERSION" ]; then
-            echo "Bumping ${VERSION_KEY} in gradle.properties: $BASE_VERSION -> $VERSION"
-            sed -i -E "s|^(${VERSION_KEY}[[:space:]]*=[[:space:]]*).*|\1${VERSION}|" gradle.properties
+            if [ -n "$VERSION_SOURCE" ]; then
+              VS_FILE="${VERSION_SOURCE%%:*}"
+              VS_KEY="${VERSION_SOURCE##*:}"
+              echo "Bumping ${VS_KEY} in ${VS_FILE}: $BASE_VERSION -> $VERSION"
+              sed -i -E "s|^(${VS_KEY}[[:space:]]*=[[:space:]]*).*|\1${VERSION}|" "$VS_FILE"
+            else
+              # Couldn't locate exact source; try common keys in root
+              BUMPED=0
+              for k in mod_version mcef_version version; do
+                if grep -q "^${k}[[:space:]]*=[[:space:]]*${BASE_VERSION}\b" gradle.properties 2>/dev/null; then
+                  echo "Bumping ${k} in gradle.properties: $BASE_VERSION -> $VERSION"
+                  sed -i -E "s|^(${k}[[:space:]]*=[[:space:]]*).*|\1${VERSION}|" gradle.properties
+                  BUMPED=1
+                  break
+                fi
+              done
+              if [ "$BUMPED" -eq 0 ]; then
+                echo "::warning::Could not locate version source to bump; tag will be $VERSION but build may use $BASE_VERSION"
+              fi
+            fi
           fi
 
-          echo "version_key=$VERSION_KEY" >> $GITHUB_OUTPUT
           echo "name=$NAME" >> $GITHUB_OUTPUT
           echo "version=$VERSION" >> $GITHUB_OUTPUT
 
@@ -177,13 +307,16 @@ jobs:
 
           mkdir -p collected-jars
 
-          # Find all jars matching the mod name + version, across all build/libs/ dirs.
-          # Skip *-sources.jar, *-dev.jar, *-shadow.jar (intermediate/dev artifacts).
+          # For multi-loader, the NAME we resolved (e.g. "mcef-fabric") may only match
+          # one loader's jars. Also accept other loader-suffixed variants.
+          # Strip a trailing -fabric/-forge/-neoforge/-quilt for a "base" pattern.
+          BASE_NAME=$(echo "$NAME" | sed -E 's/-(fabric|forge|neoforge|quilt)$//')
+
           FOUND=0
           while IFS= read -r jar; do
             base=$(basename "$jar")
             case "$base" in
-              *-sources.jar|*-dev.jar|*-dev-shadow.jar|*-shadow.jar|*-transformProductionFabric.jar|*-transformProductionForge.jar|*-transformProductionNeoForge.jar)
+              *-sources.jar|*-dev.jar|*-dev-shadow.jar|*-shadow.jar|*-shadow-dev.jar|*-transformProductionFabric.jar|*-transformProductionForge.jar|*-transformProductionNeoForge.jar)
                 echo "Skipping intermediate: $base"
                 continue
                 ;;
@@ -193,9 +326,9 @@ jobs:
             FOUND=$((FOUND+1))
           done < <(find . -path "*/build/libs/*.jar" \
             -not -path "*/.gradle/*" \
-            2>/dev/null | grep -E "/${NAME}[-_].*${VERSION}.*\.jar$" || true)
+            2>/dev/null | grep -E "/(${NAME}|${BASE_NAME}(-(fabric|forge|neoforge|quilt))?)[-_].*${VERSION}.*\.jar$" || true)
 
-          # Fallback: if nothing matched the name/version pattern, try root build/libs only
+          # Fallback: root build/libs
           if [ "$FOUND" -eq 0 ]; then
             ROOT_JAR="build/libs/${NAME}-${VERSION}.jar"
             if [ -f "$ROOT_JAR" ]; then

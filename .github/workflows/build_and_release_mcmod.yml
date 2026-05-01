@@ -221,6 +221,19 @@ jobs:
             done
           fi
 
+          # Fallback: derive name from maven_group (last segment)
+          if [ -z "$NAME" ]; then
+            for props in gradle.properties */gradle.properties; do
+              [ -f "$props" ] || continue
+              MG=$(lookup_in_props "maven_group" "$props")
+              if [ -n "$MG" ]; then
+                NAME="${MG##*.}"
+                echo "Derived NAME from maven_group: $NAME"
+                break
+              fi
+            done
+          fi
+
           if [ -z "$NAME" ] || [ -z "$BASE_VERSION" ]; then
             echo "::error::Failed to resolve mod name/version"
             echo "  NAME='$NAME'"

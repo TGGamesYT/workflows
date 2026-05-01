@@ -57,12 +57,34 @@ jobs:
           else
             echo "Detected single-loader mod project"
           fi
+      - name: Detect Java version
+        id: java_ver
+        run: |
+          FILE=$(find . -maxdepth 3 -name "build.gradle*" | head -n1)
 
-      - name: Set up JDK 21
+          if [ -z "$FILE" ]; then
+            echo "version=21" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          VER=$(grep -E "VERSION_[0-9]+" "$FILE" | head -n1 | sed -E 's/.*VERSION_([0-9]+).*/\1/')
+
+          if [ -z "$VER" ]; then
+            # fallback to release =
+            VER=$(grep -E "release *= *[0-9]+" "$FILE" | head -n1 | sed -E 's/.*release *= *([0-9]+).*/\1/')
+          fi
+
+          if [ -z "$VER" ]; then
+            VER=21
+          fi
+
+          echo "Detected Java version: $VER"
+          echo "version=$VER" >> $GITHUB_OUTPUT
+      - name: Set up JDK
         uses: actions/setup-java@v4
         with:
-          distribution: temurin
-          java-version: 21
+           distribution: temurin
+           java-version: ${{ steps.java_ver.outputs.version }}
 
       - name: Read mod info from gradle files
         id: mod_info

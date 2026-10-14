@@ -57,6 +57,7 @@ jobs:
           else
             echo "Detected single-loader mod project"
           fi
+
       - name: Detect Java version
         id: java_ver
         run: |
@@ -80,11 +81,12 @@ jobs:
 
           echo "Detected Java version: $VER"
           echo "version=$VER" >> $GITHUB_OUTPUT
+
       - name: Set up JDK
         uses: actions/setup-java@v4
         with:
-           distribution: temurin
-           java-version: ${{ steps.java_ver.outputs.version }}
+          distribution: temurin
+          java-version: ${{ steps.java_ver.outputs.version }}
 
       - name: Read mod info from gradle files
         id: mod_info
@@ -243,7 +245,7 @@ jobs:
             done
           fi
 
-          # Fallback: derive name from maven_group (last segment)
+          # Fallback 1: derive name from maven_group (last segment)
           if [ -z "$NAME" ]; then
             for props in gradle.properties */gradle.properties; do
               [ -f "$props" ] || continue
@@ -254,6 +256,25 @@ jobs:
                 break
               fi
             done
+          fi
+
+          # Fallback 2: derive name from group (last segment)
+          if [ -z "$NAME" ]; then
+            for props in gradle.properties */gradle.properties; do
+              [ -f "$props" ] || continue
+              G=$(lookup_in_props "group" "$props" | tr -d "\"'")
+              if [ -n "$G" ]; then
+                NAME="${G##*.}"
+                echo "Derived NAME from group: $NAME"
+                break
+              fi
+            done
+          fi
+
+          # Fallback 3: use the repository name
+          if [ -z "$NAME" ] && [ -n "$GITHUB_REPOSITORY" ]; then
+            NAME="${GITHUB_REPOSITORY##*/}"
+            echo "Derived NAME from repository name: $NAME"
           fi
 
           if [ -z "$NAME" ] || [ -z "$BASE_VERSION" ]; then
@@ -342,15 +363,25 @@ jobs:
 
           BASE_NAME=$(echo "$NAME" | sed -E 's/-(fabric|forge|neoforge|quilt)$//')
 
-          FOUND=0
-          while IFS= read -r jar; do
-            base=$(basename "$jar")
-            case "$base" in
+          # Intermediate / non-distributable jars
+          is_intermediate() {
+            case "$1" in
               *-sources.jar|*-dev.jar|*-dev-shadow.jar|*-shadow.jar|*-shadow-dev.jar|*-transformProductionFabric.jar|*-transformProductionForge.jar|*-transformProductionNeoForge.jar)
-                echo "Skipping intermediate: $base"
-                continue
+                return 0
                 ;;
             esac
+            return 1
+          }
+
+          FOUND=0
+
+          # Pass 1: strict match on name + version (original behaviour)
+          while IFS= read -r jar; do
+            base=$(basename "$jar")
+            if is_intermediate "$base"; then
+              echo "Skipping intermediate: $base"
+              continue
+            fi
             echo "Collecting: $jar"
             cp "$jar" collected-jars/
             FOUND=$((FOUND+1))
@@ -358,6 +389,7 @@ jobs:
             -not -path "*/.gradle/*" \
             2>/dev/null | grep -E "/(${NAME}|${BASE_NAME}(-(fabric|forge|neoforge|quilt))?)[-_].*${VERSION}.*\.jar$" || true)
 
+          # Pass 2: root jar by exact name
           if [ "$FOUND" -eq 0 ]; then
             ROOT_JAR="build/libs/${NAME}-${VERSION}.jar"
             if [ -f "$ROOT_JAR" ]; then
@@ -366,8 +398,40 @@ jobs:
             fi
           fi
 
+          # Pass 3: anything in build/libs that is not an intermediate jar
           if [ "$FOUND" -eq 0 ]; then
-            echo "::error::No matching jars found for ${NAME} ${VERSION}"
+            echo "::warning::No jar matched ${NAME} ${VERSION}; falling back to any jar in build/libs"
+            while IFS= read -r jar; do
+              base=$(basename "$jar")
+              if is_intermediate "$base"; then
+                echo "Skipping intermediate: $base"
+                continue
+              fi
+              case "$base" in
+                *-javadoc.jar) continue ;;
+              esac
+              echo "Collecting (fallback): $jar"
+              cp "$jar" collected-jars/
+              FOUND=$((FOUND+1))
+            done < <(find . -path "*/build/libs/*.jar" -not -path "*/.gradle/*" 2>/dev/null)
+          fi
+
+          # Pass 4: last resort - everything except -sources.jar
+          if [ "$FOUND" -eq 0 ]; then
+            echo "::warning::Only intermediate jars found; taking everything except -sources.jar"
+            while IFS= read -r jar; do
+              base=$(basename "$jar")
+              case "$base" in
+                *-sources.jar|*-javadoc.jar) continue ;;
+              esac
+              echo "Collecting (last resort): $jar"
+              cp "$jar" collected-jars/
+              FOUND=$((FOUND+1))
+            done < <(find . -path "*/build/libs/*.jar" -not -path "*/.gradle/*" 2>/dev/null)
+          fi
+
+          if [ "$FOUND" -eq 0 ]; then
+            echo "::error::No jars found in any build/libs directory"
             echo "Available jars:"
             find . -path "*/build/libs/*.jar" -not -path "*/.gradle/*" 2>/dev/null || true
             exit 1
